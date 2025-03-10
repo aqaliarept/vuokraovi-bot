@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -27,6 +28,12 @@ type RentalOffer struct {
 }
 
 func main() {
+	// Define command-line flags
+	maxPagesPtr := flag.Int("limit", 0, "Maximum number of pages to query (0 = no limit)")
+	verbosePtr := flag.Bool("verbose", false, "Enable verbose logging")
+	formDataFilePtr := flag.String("form", "form_data.txt", "Path to form data file")
+	flag.Parse()
+
 	// Set up logging
 	log.SetOutput(os.Stdout)
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
@@ -53,28 +60,40 @@ func main() {
 	baseURL := "https://www.vuokraovi.com"
 
 	// Read form data from file
-	formData, err := os.ReadFile("form_data.txt")
+	formData, err := os.ReadFile(*formDataFilePtr)
 	if err != nil {
-		log.Fatalf("Error reading form data: %v", err)
+		log.Fatalf("Error reading form data from %s: %v", *formDataFilePtr, err)
 	}
 
 	// Send initial POST request
 	initialURL := "https://www.vuokraovi.com/haku/vuokra-asunnot?locale=fi"
-	log.Printf("Sending initial POST request to %s", initialURL)
+	if *verbosePtr {
+		log.Printf("Sending initial POST request to %s", initialURL)
+	}
 
-	offers, nextPageURL, err := fetchAndParse(client, initialURL, "POST", string(formData), baseURL)
+	offers, nextPageURL, err := fetchAndParse(client, initialURL, "POST", string(formData), baseURL, *verbosePtr)
 	if err != nil {
 		log.Fatalf("Error fetching initial page: %v", err)
 	}
 
 	allOffers := offers
 
-	// Follow pagination links until the end
+	// Follow pagination links until the end or until max pages is reached
 	pageNum := 2
 	for nextPageURL != "" {
-		log.Printf("Fetching page %d: %s", pageNum, nextPageURL)
+		// Check if we've reached the maximum number of pages
+		if *maxPagesPtr > 0 && pageNum > *maxPagesPtr {
+			if *verbosePtr {
+				log.Printf("Reached maximum number of pages (%d). Stopping pagination.", *maxPagesPtr)
+			}
+			break
+		}
 
-		pageOffers, newNextPageURL, err := fetchAndParse(client, nextPageURL, "GET", "", baseURL)
+		if *verbosePtr {
+			log.Printf("Fetching page %d: %s", pageNum, nextPageURL)
+		}
+
+		pageOffers, newNextPageURL, err := fetchAndParse(client, nextPageURL, "GET", "", baseURL, *verbosePtr)
 		if err != nil {
 			log.Printf("Error fetching page %d: %v", pageNum, err)
 			break
@@ -90,7 +109,7 @@ func main() {
 }
 
 // fetchAndParse sends a request to the specified URL and parses the response
-func fetchAndParse(client *http.Client, targetURL, method, formData, baseURL string) ([]RentalOffer, string, error) {
+func fetchAndParse(client *http.Client, targetURL, method, formData, baseURL string, verbose bool) ([]RentalOffer, string, error) {
 	var req *http.Request
 	var err error
 
@@ -139,6 +158,10 @@ func fetchAndParse(client *http.Client, targetURL, method, formData, baseURL str
 	// Extract rental offers using the function from parser.go
 	offers := extractRentalOffers(doc, baseURL)
 
+	if verbose {
+		log.Printf("Found %d offers on current page", len(offers))
+	}
+
 	// Check for pagination link
 	nextPageURL := ""
 	doc.Find("link[rel='next']").Each(func(i int, s *goquery.Selection) {
@@ -158,6 +181,7 @@ func printResults(offers []RentalOffer) {
 	titleColor := color.New(color.FgCyan, color.Bold)
 	addressColor := color.New(color.FgYellow)
 	priceColor := color.New(color.FgGreen, color.Bold)
+	roomsColor := color.New(color.FgMagenta, color.Bold)
 	detailsColor := color.New(color.FgWhite)
 	linkColor := color.New(color.FgBlue, color.Underline)
 
@@ -178,12 +202,13 @@ func printResults(offers []RentalOffer) {
 			priceColor.Printf("Price: %s\n", offer.Price)
 		}
 
+		if offer.Rooms != "" {
+			roomsColor.Printf("Rooms: %s\n", offer.Rooms)
+		}
+
 		details := []string{}
 		if offer.Size != "" {
 			details = append(details, "Size: "+offer.Size)
-		}
-		if offer.Rooms != "" {
-			details = append(details, "Rooms: "+offer.Rooms)
 		}
 		if offer.Available != "" {
 			details = append(details, "Available: "+offer.Available)
