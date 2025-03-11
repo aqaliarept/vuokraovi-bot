@@ -309,24 +309,7 @@ func (bs *BotState) ResetUserState(chatID int64) {
 	}
 }
 
-// setupCommands sets up the bot's command menu
-func setupCommands(bot *tgbotapi.BotAPI) error {
-	commands := []tgbotapi.BotCommand{
-		{Command: "start", Description: "Start the bot and get current offers"},
-		{Command: "help", Description: "Show help message"},
-		{Command: "list", Description: "List all current rental offers"},
-		{Command: "reset", Description: "Reset your state and get all offers again"},
-		{Command: "notifications", Description: "Toggle notifications on/off"},
-		{Command: "status", Description: "Show bot status information"},
-		{Command: "clear", Description: "Clear your data and reset all settings"},
-	}
-
-	config := tgbotapi.NewSetMyCommands(commands...)
-	_, err := bot.Request(config)
-	return err
-}
-
-// RunBot starts the Telegram bot
+// Remove setupCommands function as we'll use buttons instead
 func RunBot(config BotConfig) error {
 	// Initialize bot
 	bot, err := tgbotapi.NewBotAPI(config.Token)
@@ -335,11 +318,6 @@ func RunBot(config BotConfig) error {
 	}
 
 	log.Printf("Authorized on account %s", bot.Self.UserName)
-
-	// Set up command menu
-	if err := setupCommands(bot); err != nil {
-		log.Printf("Warning: Failed to set up command menu: %v", err)
-	}
 
 	// Initialize bot state
 	state := NewBotState()
@@ -359,8 +337,6 @@ func RunBot(config BotConfig) error {
 	for update := range updates {
 		if update.Message != nil {
 			handleMessage(bot, state, update.Message, config)
-		} else if update.CallbackQuery != nil {
-			handleCallbackQuery(bot, state, update.CallbackQuery, config)
 		}
 	}
 
@@ -583,50 +559,56 @@ func handleMessage(bot *tgbotapi.BotAPI, state *BotState, message *tgbotapi.Mess
 	// Add or update user
 	_ = state.AddUser(message.From, message.Chat.ID)
 
-	// Handle commands
-	if message.IsCommand() {
-		switch message.Command() {
-		case "start":
-			handleStartCommand(bot, state, message, config)
-		case "help":
-			handleHelpCommand(bot, message)
-		case "list":
-			handleListCommand(bot, state, message)
-		case "reset":
-			handleResetCommand(bot, state, message)
-		case "notifications":
-			handleNotificationsCommand(bot, state, message)
-		case "status":
-			handleStatusCommand(bot, state, message, config)
-		case "clear":
-			handleClearCommand(bot, state, message, config)
-		default:
-			msg := tgbotapi.NewMessage(message.Chat.ID, "Unknown command. Type /help for available commands.")
-			msg.ReplyMarkup = createMainKeyboard()
-			bot.Send(msg)
-		}
-		return
+	// Handle commands and button presses
+	switch message.Text {
+	case "/start":
+		handleStartCommand(bot, state, message, config)
+	case "List Offers 📋", "/list":
+		handleListCommand(bot, state, message)
+	case "Reset 🔄", "/reset":
+		handleResetCommand(bot, state, message)
+	case "Notifications 🔔", "/notifications":
+		handleNotificationsCommand(bot, state, message)
+	case "Status 📊", "/status":
+		handleStatusCommand(bot, state, message, config)
+	case "Help ❓", "/help":
+		handleHelpCommand(bot, message)
+	case "/clear":
+		handleClearCommand(bot, state, message, config)
+	case "Enable Notifications 🔔":
+		toggleNotifications(bot, state, message.Chat.ID, true)
+	case "Disable Notifications 🔕":
+		toggleNotifications(bot, state, message.Chat.ID, false)
+	case "Back to Main Menu ↩️":
+		msg := tgbotapi.NewMessage(message.Chat.ID, "Main menu:")
+		msg.ReplyMarkup = createMainKeyboard()
+		bot.Send(msg)
+	case "Yes, Clear Data ✅":
+		handleClearConfirm(bot, state, message.Chat.ID, config)
+	case "No, Keep Data ❌":
+		msg := tgbotapi.NewMessage(message.Chat.ID, "Data clearing cancelled. Your data is safe.")
+		msg.ReplyMarkup = createMainKeyboard()
+		bot.Send(msg)
+	default:
+		msg := tgbotapi.NewMessage(message.Chat.ID, "Please use the buttons below or commands to interact with me:")
+		msg.ReplyMarkup = createMainKeyboard()
+		bot.Send(msg)
 	}
-
-	// Handle non-command messages
-	msg := tgbotapi.NewMessage(message.Chat.ID, "I only respond to commands. Type /help for available commands.")
-	msg.ReplyMarkup = createMainKeyboard()
-	bot.Send(msg)
 }
 
-// createMainKeyboard creates the main keyboard with command buttons
-func createMainKeyboard() tgbotapi.InlineKeyboardMarkup {
-	return tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("List Offers 📋", "list_all"),
-			tgbotapi.NewInlineKeyboardButtonData("Reset 🔄", "reset"),
+// createMainKeyboard to use reply keyboard instead of inline
+func createMainKeyboard() tgbotapi.ReplyKeyboardMarkup {
+	return tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("List Offers 📋"),
+			tgbotapi.NewKeyboardButton("Reset 🔄"),
 		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Notifications 🔔", "notifications"),
-			tgbotapi.NewInlineKeyboardButtonData("Status 📊", "status"),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("Notifications 🔔"),
+			tgbotapi.NewKeyboardButton("Status 📊"),
 		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Help ❓", "help"),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("Help ❓"),
 		),
 	)
 }
@@ -810,14 +792,13 @@ func handleResetCommand(bot *tgbotapi.BotAPI, state *BotState, message *tgbotapi
 
 // handleNotificationsCommand handles the /notifications command
 func handleNotificationsCommand(bot *tgbotapi.BotAPI, state *BotState, message *tgbotapi.Message) {
-	// Create inline keyboard
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Enable 🔔", "notifications_on"),
-			tgbotapi.NewInlineKeyboardButtonData("Disable 🔕", "notifications_off"),
+	keyboard := tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("Enable Notifications 🔔"),
+			tgbotapi.NewKeyboardButton("Disable Notifications 🔕"),
 		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Back to Main Menu", "help"),
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("Back to Main Menu ↩️"),
 		),
 	)
 
@@ -871,11 +852,10 @@ func handleClearCommand(bot *tgbotapi.BotAPI, state *BotState, message *tgbotapi
 		return
 	}
 
-	// Create confirmation keyboard
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Yes, clear my data ✅", "clear_confirm"),
-			tgbotapi.NewInlineKeyboardButtonData("No, keep my data ❌", "clear_cancel"),
+	keyboard := tgbotapi.NewReplyKeyboard(
+		tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton("Yes, Clear Data ✅"),
+			tgbotapi.NewKeyboardButton("No, Keep Data ❌"),
 		),
 	)
 
