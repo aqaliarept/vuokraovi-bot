@@ -28,4 +28,9 @@ go.work
 Thumbs.db
 
 # Project specific files
-cookies.txt 
+cookies.txt
+
+# Data files
+/data/
+*.json
+test_output.html 

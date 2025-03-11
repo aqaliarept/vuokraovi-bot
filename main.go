@@ -10,6 +10,7 @@ import (
 	"net/http/cookiejar"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/fatih/color"
@@ -32,8 +33,40 @@ func main() {
 	maxPagesPtr := flag.Int("limit", 0, "Maximum number of pages to query (0 = no limit)")
 	verbosePtr := flag.Bool("verbose", false, "Enable verbose logging")
 	formDataFilePtr := flag.String("form", "form_data.txt", "Path to form data file")
+
+	// Bot mode flags
+	botModePtr := flag.Bool("bot", false, "Run in Telegram bot mode")
+	botTokenPtr := flag.String("token", "", "Telegram Bot API token (required for bot mode)")
+	updateIntervalPtr := flag.Int("interval", 30, "Update interval in minutes (for bot mode)")
+	dataDirPtr := flag.String("data", "./data", "Directory to store persistent data (for bot mode)")
+
 	flag.Parse()
 
+	// Check if bot mode is enabled
+	if *botModePtr {
+		// Validate bot mode parameters
+		if *botTokenPtr == "" {
+			log.Fatal("Error: Telegram Bot API token is required for bot mode")
+		}
+
+		// Create bot config
+		config := BotConfig{
+			Token:          *botTokenPtr,
+			UpdateInterval: time.Duration(*updateIntervalPtr) * time.Minute,
+			DataDir:        *dataDirPtr,
+			FormDataFile:   *formDataFilePtr,
+			MaxPages:       *maxPagesPtr,
+		}
+
+		// Run bot
+		log.Println("Starting Vuokraovi Rental Bot...")
+		if err := RunBot(config); err != nil {
+			log.Fatalf("Error running bot: %v", err)
+		}
+		return
+	}
+
+	// Console mode (original functionality)
 	// Set up logging
 	log.SetOutput(os.Stdout)
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
