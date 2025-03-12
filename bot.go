@@ -1,315 +1,25 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
-	"net/http/cookiejar"
 	"os"
-	"path/filepath"
-	"strings"
-	"sync"
 	"time"
 
+	"github.com/aqaliarept/vuokraovi-bot/state"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 // BotConfig holds the configuration for the Telegram bot
 type BotConfig struct {
-	Token          string        // Telegram Bot API token
-	UpdateInterval time.Duration // How often to check for new rental offers
-	DataDir        string        // Directory to store persistent data
-	FormDataFile   string        // Path to form data file
-	MaxPages       int           // Maximum number of pages to query
+	Token          string
+	UpdateInterval time.Duration
+	DataDir        string
+	FormDataFile   string
+	MaxPages       int
 }
 
-// UserState represents the state of a user
-type UserState struct {
-	ChatID        int64           `json:"chat_id"`
-	Username      string          `json:"username"`
-	FirstName     string          `json:"first_name"`
-	LastName      string          `json:"last_name"`
-	LastNotified  time.Time       `json:"last_notified"`
-	SeenOffers    map[string]bool `json:"seen_offers"`   // Map of offer links that the user has seen
-	Notifications bool            `json:"notifications"` // Whether the user wants to receive notifications
-}
-
-// BotState represents the state of the bot
-type BotState struct {
-	Users       map[int64]*UserState   `json:"users"`
-	KnownOffers map[string]RentalOffer `json:"known_offers"` // Map of all known offers by link
-	LastUpdated time.Time              `json:"last_updated"`
-	mutex       sync.Mutex             // Mutex to protect concurrent access to the state
-}
-
-// NewBotState creates a new bot state
-func NewBotState() *BotState {
-	return &BotState{
-		Users:       make(map[int64]*UserState),
-		KnownOffers: make(map[string]RentalOffer),
-		LastUpdated: time.Now(),
-	}
-}
-
-// cleanURL removes query parameters from a URL
-func cleanURL(url string) string {
-	// Find the position of '?' in the URL
-	pos := strings.Index(url, "?")
-	if pos == -1 {
-		return url
-	}
-	// Return the URL without query parameters
-	return url[:pos]
-}
-
-// SaveState saves the bot state to disk
-func (bs *BotState) SaveState(dataDir string) error {
-	// Create a copy of the state to avoid holding the lock during file operations
-	bs.mutex.Lock()
-	stateCopy := &BotState{
-		Users:       make(map[int64]*UserState, len(bs.Users)),
-		KnownOffers: make(map[string]RentalOffer, len(bs.KnownOffers)),
-		LastUpdated: bs.LastUpdated,
-	}
-
-	// First, clean up and validate KnownOffers
-	for k, v := range bs.KnownOffers {
-		cleanLink := cleanURL(k)
-		if cleanLink != "" && v.Link != "" {
-			stateCopy.KnownOffers[cleanLink] = v
-		}
-	}
-
-	// Then, clean up and validate Users
-	for k, v := range bs.Users {
-		if v == nil {
-			continue
-		}
-		userCopy := *v
-		if userCopy.SeenOffers == nil {
-			userCopy.SeenOffers = make(map[string]bool)
-		}
-		// Clean up any invalid seen offers
-		validSeenOffers := make(map[string]bool)
-		for link := range userCopy.SeenOffers {
-			cleanLink := cleanURL(link)
-			if _, exists := stateCopy.KnownOffers[cleanLink]; exists {
-				validSeenOffers[cleanLink] = true
-			}
-		}
-		userCopy.SeenOffers = validSeenOffers
-		stateCopy.Users[k] = &userCopy
-	}
-	bs.mutex.Unlock()
-
-	// Create data directory if it doesn't exist
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
-		return fmt.Errorf("failed to create data directory: %w", err)
-	}
-
-	// Save bot state
-	stateFile := filepath.Join(dataDir, "bot_state.json")
-	data, err := json.MarshalIndent(stateCopy, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal bot state: %w", err)
-	}
-
-	if err := os.WriteFile(stateFile, data, 0644); err != nil {
-		return fmt.Errorf("failed to write bot state file: %w", err)
-	}
-
-	return nil
-}
-
-// LoadState loads the bot state from disk
-func (bs *BotState) LoadState(dataDir string) error {
-	bs.mutex.Lock()
-	defer bs.mutex.Unlock()
-
-	stateFile := filepath.Join(dataDir, "bot_state.json")
-	if _, err := os.Stat(stateFile); os.IsNotExist(err) {
-		// State file doesn't exist, initialize with empty state
-		bs.Users = make(map[int64]*UserState)
-		bs.KnownOffers = make(map[string]RentalOffer)
-		bs.LastUpdated = time.Now()
-		return nil
-	}
-
-	data, err := os.ReadFile(stateFile)
-	if err != nil {
-		return fmt.Errorf("failed to read bot state file: %w", err)
-	}
-
-	// Initialize empty state first
-	bs.Users = make(map[int64]*UserState)
-	bs.KnownOffers = make(map[string]RentalOffer)
-	bs.LastUpdated = time.Now()
-
-	var loadedState BotState
-	if err := json.Unmarshal(data, &loadedState); err != nil {
-		return fmt.Errorf("failed to unmarshal bot state: %w", err)
-	}
-
-	// Clean up and validate loaded state
-	if loadedState.Users == nil {
-		loadedState.Users = make(map[int64]*UserState)
-	}
-	if loadedState.KnownOffers == nil {
-		loadedState.KnownOffers = make(map[string]RentalOffer)
-	}
-
-	// First, clean up and validate KnownOffers
-	uniqueOffers := make(map[string]RentalOffer)
-	for k, v := range loadedState.KnownOffers {
-		cleanLink := cleanURL(k)
-		if cleanLink != "" && v.Link != "" {
-			uniqueOffers[cleanLink] = v
-		}
-	}
-	bs.KnownOffers = uniqueOffers
-
-	// Then, clean up and validate Users
-	for k, v := range loadedState.Users {
-		if v == nil {
-			continue
-		}
-		userCopy := *v
-		if userCopy.SeenOffers == nil {
-			userCopy.SeenOffers = make(map[string]bool)
-		}
-		// Clean up any invalid seen offers
-		validSeenOffers := make(map[string]bool)
-		for link := range userCopy.SeenOffers {
-			cleanLink := cleanURL(link)
-			if _, exists := bs.KnownOffers[cleanLink]; exists {
-				validSeenOffers[cleanLink] = true
-			}
-		}
-		userCopy.SeenOffers = validSeenOffers
-		bs.Users[k] = &userCopy
-	}
-
-	if !loadedState.LastUpdated.IsZero() {
-		bs.LastUpdated = loadedState.LastUpdated
-	}
-
-	return nil
-}
-
-// cleanupState ensures data consistency by removing any duplicates
-func (bs *BotState) cleanupState() {
-	// Clean up duplicate offers
-	uniqueOffers := make(map[string]RentalOffer, len(bs.KnownOffers))
-	for _, offer := range bs.KnownOffers {
-		cleanLink := cleanURL(offer.Link)
-		uniqueOffers[cleanLink] = offer
-	}
-	bs.KnownOffers = uniqueOffers
-
-	// Clean up duplicate seen offers for each user
-	for _, user := range bs.Users {
-		if user.SeenOffers == nil {
-			user.SeenOffers = make(map[string]bool)
-		}
-		uniqueSeen := make(map[string]bool, len(user.SeenOffers))
-		for link := range user.SeenOffers {
-			cleanLink := cleanURL(link)
-			uniqueSeen[cleanLink] = true
-		}
-		user.SeenOffers = uniqueSeen
-	}
-}
-
-// CleanupInactiveUsers removes users who haven't been active for more than 30 days
-func (bs *BotState) CleanupInactiveUsers(dataDir string) error {
-	bs.mutex.Lock()
-	defer bs.mutex.Unlock()
-
-	now := time.Now()
-	inactiveThreshold := now.AddDate(0, 0, -30) // 30 days ago
-
-	for chatID, user := range bs.Users {
-		if user.LastNotified.Before(inactiveThreshold) {
-			delete(bs.Users, chatID)
-		}
-	}
-
-	return bs.SaveState(dataDir)
-}
-
-// AddUser adds a new user to the bot state
-func (bs *BotState) AddUser(user *tgbotapi.User, chatID int64) *UserState {
-	bs.mutex.Lock()
-	defer bs.mutex.Unlock()
-
-	if _, exists := bs.Users[chatID]; !exists {
-		bs.Users[chatID] = &UserState{
-			ChatID:        chatID,
-			Username:      user.UserName,
-			FirstName:     user.FirstName,
-			LastName:      user.LastName,
-			LastNotified:  time.Time{},
-			SeenOffers:    make(map[string]bool),
-			Notifications: true,
-		}
-	} else {
-		// Update user info if it has changed
-		bs.Users[chatID].Username = user.UserName
-		bs.Users[chatID].FirstName = user.FirstName
-		bs.Users[chatID].LastName = user.LastName
-	}
-
-	return bs.Users[chatID]
-}
-
-// GetUser gets a user from the bot state
-func (bs *BotState) GetUser(chatID int64) (*UserState, bool) {
-	bs.mutex.Lock()
-	defer bs.mutex.Unlock()
-
-	user, exists := bs.Users[chatID]
-	return user, exists
-}
-
-// UpdateOffers updates the known offers in the bot state
-func (bs *BotState) UpdateOffers(offers []RentalOffer) []RentalOffer {
-	bs.mutex.Lock()
-	defer bs.mutex.Unlock()
-
-	var newOffers []RentalOffer
-
-	// Check for new offers
-	for _, offer := range offers {
-		cleanLink := cleanURL(offer.Link)
-		if cleanLink != "" {
-			// Create a copy of the offer with cleaned link
-			offerCopy := offer
-			offerCopy.Link = cleanLink
-
-			if _, exists := bs.KnownOffers[cleanLink]; !exists {
-				newOffers = append(newOffers, offerCopy)
-				bs.KnownOffers[cleanLink] = offerCopy
-			}
-		}
-	}
-
-	bs.LastUpdated = time.Now()
-	return newOffers
-}
-
-// ResetUserState resets a user's state
-func (bs *BotState) ResetUserState(chatID int64) {
-	bs.mutex.Lock()
-	defer bs.mutex.Unlock()
-
-	if user, exists := bs.Users[chatID]; exists {
-		user.SeenOffers = make(map[string]bool)
-		user.LastNotified = time.Time{}
-	}
-}
-
-// Remove setupCommands function as we'll use buttons instead
+// RunBot starts the bot and runs it indefinitely
 func RunBot(config BotConfig) error {
 	// Initialize bot
 	bot, err := tgbotapi.NewBotAPI(config.Token)
@@ -320,8 +30,8 @@ func RunBot(config BotConfig) error {
 	log.Printf("Authorized on account %s", bot.Self.UserName)
 
 	// Initialize bot state
-	state := NewBotState()
-	if err := state.LoadState(config.DataDir); err != nil {
+	botState := state.NewBotState(config.DataDir)
+	if err := botState.LoadState(); err != nil {
 		log.Printf("Warning: Failed to load bot state: %v", err)
 	}
 
@@ -331,12 +41,12 @@ func RunBot(config BotConfig) error {
 	updates := bot.GetUpdatesChan(u)
 
 	// Start periodic update goroutine
-	go periodicUpdate(bot, state, config)
+	go periodicUpdate(bot, botState, config)
 
 	// Process updates
 	for update := range updates {
 		if update.Message != nil {
-			handleMessage(bot, state, update.Message, config)
+			handleMessage(bot, botState, update.Message, config)
 		}
 	}
 
@@ -344,7 +54,7 @@ func RunBot(config BotConfig) error {
 }
 
 // periodicUpdate periodically checks for new rental offers and notifies users
-func periodicUpdate(bot *tgbotapi.BotAPI, state *BotState, config BotConfig) {
+func periodicUpdate(bot *tgbotapi.BotAPI, botState *state.BotState, config BotConfig) {
 	// Start with a small delay to allow bot to initialize
 	time.Sleep(5 * time.Second)
 
@@ -357,7 +67,7 @@ func periodicUpdate(bot *tgbotapi.BotAPI, state *BotState, config BotConfig) {
 
 	// Start initial update in a separate goroutine
 	go func() {
-		if err := updateAndNotify(bot, state, config); err != nil {
+		if err := updateAndNotify(bot, botState, config); err != nil {
 			log.Printf("Error during initial update: %v", err)
 		}
 		close(initialUpdateDone)
@@ -372,40 +82,29 @@ func periodicUpdate(bot *tgbotapi.BotAPI, state *BotState, config BotConfig) {
 	}
 
 	// Continue with periodic updates
-	for {
-		select {
-		case <-ticker.C:
-			if err := updateAndNotify(bot, state, config); err != nil {
-				log.Printf("Error during periodic update: %v", err)
-				// Continue with next update even if this one failed
-				continue
-			}
+	for range ticker.C {
+		if err := updateAndNotify(bot, botState, config); err != nil {
+			log.Printf("Error during periodic update: %v", err)
+			continue
 		}
 	}
 }
 
 // updateAndNotify updates the rental offers and notifies users about new offers
-func updateAndNotify(bot *tgbotapi.BotAPI, state *BotState, config BotConfig) error {
+func updateAndNotify(bot *tgbotapi.BotAPI, botState *state.BotState, config BotConfig) error {
 	log.Println("Checking for new rental offers...")
 
 	// Fetch rental offers
 	offers, err := fetchRentalOffers(config.FormDataFile, config.MaxPages)
 	if err != nil {
-		return fmt.Errorf("error fetching rental offers: %w", err)
+		return fmt.Errorf("error fetching rental offers: %v", err)
 	}
 
-	// Update offers in state
-	newOffers := state.UpdateOffers(offers)
+	// Update offers in state and get new ones
+	newOffers := botState.UpdateOffers(offers)
 	if len(newOffers) > 0 {
 		log.Printf("Found %d new rental offers", len(newOffers))
-
-		// Notify users about new offers
-		notifyUsers(bot, state, newOffers)
-
-		// Save state
-		if err := state.SaveState(config.DataDir); err != nil {
-			log.Printf("Error saving bot state: %v", err)
-		}
+		notifyUsers(bot, botState, newOffers)
 	} else {
 		log.Println("No new rental offers found")
 	}
@@ -413,26 +112,13 @@ func updateAndNotify(bot *tgbotapi.BotAPI, state *BotState, config BotConfig) er
 	return nil
 }
 
-// fetchRentalOffers fetches rental offers using the existing functionality
-func fetchRentalOffers(formDataFile string, maxPages int) ([]RentalOffer, error) {
-	// Create a temporary client
-	jar, err := cookiejar.New(nil)
+// fetchRentalOffers fetches rental offers using the WebSite struct
+func fetchRentalOffers(formDataFile string, maxPages int) ([]state.RentalOffer, error) {
+	// Create website client
+	website, err := NewWebSite(false) // verbose=false for bot mode
 	if err != nil {
-		return nil, fmt.Errorf("error creating cookie jar: %w", err)
+		return nil, fmt.Errorf("error creating website client: %w", err)
 	}
-
-	client := &http.Client{
-		Jar: jar,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return fmt.Errorf("too many redirects")
-			}
-			return nil
-		},
-	}
-
-	// Base URL for the website
-	baseURL := "https://www.vuokraovi.com"
 
 	// Read form data from file
 	formData, err := os.ReadFile(formDataFile)
@@ -440,72 +126,35 @@ func fetchRentalOffers(formDataFile string, maxPages int) ([]RentalOffer, error)
 		return nil, fmt.Errorf("error reading form data from %s: %w", formDataFile, err)
 	}
 
-	// Send initial POST request
-	initialURL := "https://www.vuokraovi.com/haku/vuokra-asunnot?locale=fi"
-	offers, nextPageURL, err := fetchAndParse(client, initialURL, "POST", string(formData), baseURL, false)
+	// Fetch offers using the website client
+	offers, err := website.FetchRentalOffers(string(formData), maxPages)
 	if err != nil {
-		return nil, fmt.Errorf("error fetching initial page: %w", err)
+		return nil, fmt.Errorf("error fetching rental offers: %w", err)
 	}
 
-	// Use a map to track unique offers by their links
-	uniqueOffers := make(map[string]RentalOffer)
-	for _, offer := range offers {
-		cleanLink := cleanURL(offer.Link)
-		if cleanLink != "" {
-			// Create a copy of the offer with cleaned link
-			offerCopy := offer
-			offerCopy.Link = cleanLink
-			uniqueOffers[cleanLink] = offerCopy
+	// Convert RentalOffer to state.RentalOffer
+	stateOffers := make([]state.RentalOffer, len(offers))
+	for i, offer := range offers {
+		stateOffers[i] = state.RentalOffer{
+			Title:     offer.Title,
+			Address:   offer.Address,
+			Price:     offer.Price,
+			Size:      offer.Size,
+			Rooms:     offer.Rooms,
+			Available: offer.Available,
+			Link:      offer.Link,
 		}
 	}
 
-	// Follow pagination links until the end or until max pages is reached
-	pageNum := 2
-	for nextPageURL != "" {
-		// Check if we've reached the maximum number of pages
-		if maxPages > 0 && pageNum > maxPages {
-			break
-		}
-
-		pageOffers, newNextPageURL, err := fetchAndParse(client, nextPageURL, "GET", "", baseURL, false)
-		if err != nil {
-			log.Printf("Error fetching page %d: %v", pageNum, err)
-			break
-		}
-
-		// Add only unique offers from this page
-		for _, offer := range pageOffers {
-			cleanLink := cleanURL(offer.Link)
-			if cleanLink != "" {
-				// Create a copy of the offer with cleaned link
-				offerCopy := offer
-				offerCopy.Link = cleanLink
-				if _, exists := uniqueOffers[cleanLink]; !exists {
-					uniqueOffers[cleanLink] = offerCopy
-				}
-			}
-		}
-
-		nextPageURL = newNextPageURL
-		pageNum++
-	}
-
-	// Convert map back to slice
-	allOffers := make([]RentalOffer, 0, len(uniqueOffers))
-	for _, offer := range uniqueOffers {
-		allOffers = append(allOffers, offer)
-	}
-
-	return allOffers, nil
+	return stateOffers, nil
 }
 
 // notifyUsers notifies users about new rental offers
-func notifyUsers(bot *tgbotapi.BotAPI, state *BotState, newOffers []RentalOffer) {
-	state.mutex.Lock()
-	defer state.mutex.Unlock()
+func notifyUsers(bot *tgbotapi.BotAPI, botState *state.BotState, newOffers []state.RentalOffer) {
+	users := botState.GetAllUsers()
 
-	for chatID, user := range state.Users {
-		if !user.Notifications {
+	for chatID := range users {
+		if !botState.GetUserNotificationsEnabled(chatID) {
 			continue
 		}
 
@@ -530,7 +179,7 @@ func notifyUsers(bot *tgbotapi.BotAPI, state *BotState, newOffers []RentalOffer)
 			message += fmt.Sprintf("🔗 [View Details](%s)\n\n", offer.Link)
 
 			// Mark offer as seen by this user
-			user.SeenOffers[offer.Link] = true
+			botState.MarkOfferAsSeen(chatID, offer.Link)
 		}
 
 		// Create keyboard with list button
@@ -549,42 +198,42 @@ func notifyUsers(bot *tgbotapi.BotAPI, state *BotState, newOffers []RentalOffer)
 		if _, err := bot.Send(msg); err != nil {
 			log.Printf("Error sending message to user %d: %v", chatID, err)
 		} else {
-			user.LastNotified = time.Now()
+			botState.UpdateUserLastNotified(chatID, time.Now())
 		}
 	}
 }
 
 // handleMessage handles incoming messages
-func handleMessage(bot *tgbotapi.BotAPI, state *BotState, message *tgbotapi.Message, config BotConfig) {
+func handleMessage(bot *tgbotapi.BotAPI, botState *state.BotState, message *tgbotapi.Message, config BotConfig) {
 	// Add or update user
-	_ = state.AddUser(message.From, message.Chat.ID)
+	botState.AddUser(message.From, message.Chat.ID)
 
 	// Handle commands and button presses
 	switch message.Text {
 	case "/start":
-		handleStartCommand(bot, state, message, config)
+		handleStartCommand(bot, botState, message, config)
 	case "List Offers 📋", "/list":
-		handleListCommand(bot, state, message)
+		handleListCommand(bot, botState, message)
 	case "Reset 🔄", "/reset":
-		handleResetCommand(bot, state, message)
+		handleResetCommand(bot, botState, message)
 	case "Notifications 🔔", "/notifications":
-		handleNotificationsCommand(bot, state, message)
+		handleNotificationsCommand(bot, botState, message)
 	case "Status 📊", "/status":
-		handleStatusCommand(bot, state, message, config)
+		handleStatusCommand(bot, botState, message, config)
 	case "Help ❓", "/help":
 		handleHelpCommand(bot, message)
 	case "/clear":
-		handleClearCommand(bot, state, message, config)
+		handleClearCommand(bot, botState, message, config)
 	case "Enable Notifications 🔔":
-		toggleNotifications(bot, state, message.Chat.ID, true)
+		toggleNotifications(bot, botState, message.Chat.ID, true)
 	case "Disable Notifications 🔕":
-		toggleNotifications(bot, state, message.Chat.ID, false)
+		toggleNotifications(bot, botState, message.Chat.ID, false)
 	case "Back to Main Menu ↩️":
 		msg := tgbotapi.NewMessage(message.Chat.ID, "Main menu:")
 		msg.ReplyMarkup = createMainKeyboard()
 		bot.Send(msg)
 	case "Yes, Clear Data ✅":
-		handleClearConfirm(bot, state, message.Chat.ID, config)
+		handleClearConfirm(bot, botState, message.Chat.ID, config)
 	case "No, Keep Data ❌":
 		msg := tgbotapi.NewMessage(message.Chat.ID, "Data clearing cancelled. Your data is safe.")
 		msg.ReplyMarkup = createMainKeyboard()
@@ -596,7 +245,7 @@ func handleMessage(bot *tgbotapi.BotAPI, state *BotState, message *tgbotapi.Mess
 	}
 }
 
-// createMainKeyboard to use reply keyboard instead of inline
+// createMainKeyboard creates the main keyboard markup
 func createMainKeyboard() tgbotapi.ReplyKeyboardMarkup {
 	return tgbotapi.NewReplyKeyboard(
 		tgbotapi.NewKeyboardButtonRow(
@@ -613,60 +262,24 @@ func createMainKeyboard() tgbotapi.ReplyKeyboardMarkup {
 	)
 }
 
-// handleCallbackQuery handles callback queries from inline keyboards
-func handleCallbackQuery(bot *tgbotapi.BotAPI, state *BotState, query *tgbotapi.CallbackQuery, config BotConfig) {
-	// Acknowledge the callback query
-	callback := tgbotapi.NewCallback(query.ID, "")
-	bot.Request(callback)
-
-	// Handle different callback data
-	switch query.Data {
-	case "notifications_on":
-		toggleNotifications(bot, state, query.Message.Chat.ID, true)
-	case "notifications_off":
-		toggleNotifications(bot, state, query.Message.Chat.ID, false)
-	case "list_all":
-		handleListCommand(bot, state, &tgbotapi.Message{Chat: query.Message.Chat, From: query.From})
-	case "reset":
-		handleResetCommand(bot, state, &tgbotapi.Message{Chat: query.Message.Chat, From: query.From})
-	case "notifications":
-		handleNotificationsCommand(bot, state, &tgbotapi.Message{Chat: query.Message.Chat, From: query.From})
-	case "status":
-		handleStatusCommand(bot, state, &tgbotapi.Message{Chat: query.Message.Chat, From: query.From}, config)
-	case "help":
-		handleHelpCommand(bot, &tgbotapi.Message{Chat: query.Message.Chat, From: query.From})
-	case "clear_confirm":
-		handleClearConfirm(bot, state, query.Message.Chat.ID, config)
-	case "clear_cancel":
-		msg := tgbotapi.NewMessage(query.Message.Chat.ID, "Data clearing cancelled. Your data is safe.")
-		msg.ReplyMarkup = createMainKeyboard()
-		bot.Send(msg)
-	}
-}
-
 // toggleNotifications toggles notifications for a user
-func toggleNotifications(bot *tgbotapi.BotAPI, state *BotState, chatID int64, enable bool) {
-	state.mutex.Lock()
-	defer state.mutex.Unlock()
+func toggleNotifications(bot *tgbotapi.BotAPI, botState *state.BotState, chatID int64, enable bool) {
+	botState.SetUserNotifications(chatID, enable)
 
-	if user, exists := state.Users[chatID]; exists {
-		user.Notifications = enable
-
-		var message string
-		if enable {
-			message = "✅ Notifications are now enabled. You will receive updates about new rental offers."
-		} else {
-			message = "🔕 Notifications are now disabled. You will not receive updates about new rental offers."
-		}
-
-		msg := tgbotapi.NewMessage(chatID, message)
-		msg.ReplyMarkup = createMainKeyboard()
-		bot.Send(msg)
+	var message string
+	if enable {
+		message = "✅ Notifications are now enabled. You will receive updates about new rental offers."
+	} else {
+		message = "🔕 Notifications are now disabled. You will not receive updates about new rental offers."
 	}
+
+	msg := tgbotapi.NewMessage(chatID, message)
+	msg.ReplyMarkup = createMainKeyboard()
+	bot.Send(msg)
 }
 
 // handleStartCommand handles the /start command
-func handleStartCommand(bot *tgbotapi.BotAPI, state *BotState, message *tgbotapi.Message, config BotConfig) {
+func handleStartCommand(bot *tgbotapi.BotAPI, botState *state.BotState, message *tgbotapi.Message, config BotConfig) {
 	chatID := message.Chat.ID
 
 	// Welcome message
@@ -679,12 +292,10 @@ func handleStartCommand(bot *tgbotapi.BotAPI, state *BotState, message *tgbotapi
 	bot.Send(msg)
 
 	// Send all current offers to the new user
-	state.mutex.Lock()
-	offers := make([]RentalOffer, 0, len(state.KnownOffers))
-	for _, offer := range state.KnownOffers {
+	offers := make([]state.RentalOffer, 0)
+	for _, offer := range botState.GetKnownOffers() {
 		offers = append(offers, offer)
 	}
-	state.mutex.Unlock()
 
 	if len(offers) > 0 {
 		infoMsg := fmt.Sprintf("Here are the current %d rental offers:", len(offers))
@@ -694,32 +305,12 @@ func handleStartCommand(bot *tgbotapi.BotAPI, state *BotState, message *tgbotapi
 	}
 }
 
-// handleHelpCommand handles the /help command
-func handleHelpCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
-	helpText := "🤖 *Vuokraovi Rental Bot Commands*\n\n"
-	helpText += "/start - Start the bot and get current offers\n"
-	helpText += "/help - Show this help message\n"
-	helpText += "/list - List all current rental offers\n"
-	helpText += "/reset - Reset your state and get all offers again\n"
-	helpText += "/notifications - Toggle notifications on/off\n"
-	helpText += "/status - Show bot status information\n"
-	helpText += "/clear - Clear your data and reset all settings\n\n"
-	helpText += "You can also use the buttons below for quick access to commands:"
-
-	msg := tgbotapi.NewMessage(message.Chat.ID, helpText)
-	msg.ParseMode = "Markdown"
-	msg.ReplyMarkup = createMainKeyboard()
-	bot.Send(msg)
-}
-
 // handleListCommand handles the /list command
-func handleListCommand(bot *tgbotapi.BotAPI, state *BotState, message *tgbotapi.Message) {
-	state.mutex.Lock()
-	offers := make([]RentalOffer, 0, len(state.KnownOffers))
-	for _, offer := range state.KnownOffers {
+func handleListCommand(bot *tgbotapi.BotAPI, botState *state.BotState, message *tgbotapi.Message) {
+	offers := make([]state.RentalOffer, 0)
+	for _, offer := range botState.GetKnownOffers() {
 		offers = append(offers, offer)
 	}
-	state.mutex.Unlock()
 
 	if len(offers) == 0 {
 		msg := tgbotapi.NewMessage(message.Chat.ID, "No rental offers available at the moment.")
@@ -729,15 +320,13 @@ func handleListCommand(bot *tgbotapi.BotAPI, state *BotState, message *tgbotapi.
 	}
 
 	infoMsg := fmt.Sprintf("Here are the current %d rental offers:", len(offers))
-	infoMessage := tgbotapi.NewMessage(message.Chat.ID, infoMsg)
-	infoMessage.ReplyMarkup = createMainKeyboard()
-	bot.Send(infoMessage)
+	bot.Send(tgbotapi.NewMessage(message.Chat.ID, infoMsg))
 
 	sendOffersList(bot, offers, message.Chat.ID)
 }
 
 // sendOffersList sends a list of offers to a chat
-func sendOffersList(bot *tgbotapi.BotAPI, offers []RentalOffer, chatID int64) {
+func sendOffersList(bot *tgbotapi.BotAPI, offers []state.RentalOffer, chatID int64) {
 	// Split offers into chunks to avoid message size limits
 	chunkSize := 5
 	for i := 0; i < len(offers); i += chunkSize {
@@ -779,19 +368,19 @@ func sendOffersList(bot *tgbotapi.BotAPI, offers []RentalOffer, chatID int64) {
 }
 
 // handleResetCommand handles the /reset command
-func handleResetCommand(bot *tgbotapi.BotAPI, state *BotState, message *tgbotapi.Message) {
-	state.ResetUserState(message.Chat.ID)
+func handleResetCommand(bot *tgbotapi.BotAPI, botState *state.BotState, message *tgbotapi.Message) {
+	botState.ResetUserState(message.Chat.ID)
 
 	msg := tgbotapi.NewMessage(message.Chat.ID, "✅ Your state has been reset. You will now receive all available offers again.")
 	msg.ReplyMarkup = createMainKeyboard()
 	bot.Send(msg)
 
 	// Send all current offers to the user
-	handleListCommand(bot, state, message)
+	handleListCommand(bot, botState, message)
 }
 
 // handleNotificationsCommand handles the /notifications command
-func handleNotificationsCommand(bot *tgbotapi.BotAPI, state *BotState, message *tgbotapi.Message) {
+func handleNotificationsCommand(bot *tgbotapi.BotAPI, botState *state.BotState, message *tgbotapi.Message) {
 	keyboard := tgbotapi.NewReplyKeyboard(
 		tgbotapi.NewKeyboardButtonRow(
 			tgbotapi.NewKeyboardButton("Enable Notifications 🔔"),
@@ -808,43 +397,58 @@ func handleNotificationsCommand(bot *tgbotapi.BotAPI, state *BotState, message *
 }
 
 // handleStatusCommand handles the /status command
-func handleStatusCommand(bot *tgbotapi.BotAPI, state *BotState, message *tgbotapi.Message, config BotConfig) {
+func handleStatusCommand(bot *tgbotapi.BotAPI, botState *state.BotState, message *tgbotapi.Message, config BotConfig) {
 	chatID := message.Chat.ID
 
 	// Get state information
-	state.mutex.Lock()
-	totalOffers := len(state.KnownOffers)
-	lastUpdate := state.LastUpdated
-	user, exists := state.Users[chatID]
-	state.mutex.Unlock()
+	totalOffers := len(botState.GetKnownOffers())
+	lastUpdate := botState.GetLastUpdated()
+	notifications, exists := botState.GetUserNotifications(chatID)
 
 	if !exists {
 		// Add user if they don't exist
-		state.AddUser(message.From, chatID)
-		user = state.Users[chatID]
+		botState.AddUser(message.From, chatID)
+		notifications, _ = botState.GetUserNotifications(chatID)
 	}
-
-	// Create main keyboard
-	keyboard := createMainKeyboard()
 
 	statusText := fmt.Sprintf("Bot Status:\n\n"+
 		"• Total offers: %d\n"+
 		"• Your notifications: %s\n"+
-		"• Last update: %s",
+		"• Last update: %s\n"+
+		"• Update interval: %v",
 		totalOffers,
-		map[bool]string{true: "Enabled", false: "Disabled"}[user.Notifications],
-		lastUpdate.Format("2006-01-02 15:04:05"))
+		map[bool]string{true: "Enabled ✅", false: "Disabled 🔕"}[notifications],
+		lastUpdate.Format("2006-01-02 15:04:05"),
+		config.UpdateInterval)
 
 	msg := tgbotapi.NewMessage(chatID, statusText)
-	msg.ReplyMarkup = keyboard
+	msg.ReplyMarkup = createMainKeyboard()
 	msg.ParseMode = "Markdown"
 	bot.Send(msg)
 }
 
+// handleHelpCommand handles the /help command
+func handleHelpCommand(bot *tgbotapi.BotAPI, message *tgbotapi.Message) {
+	helpText := "🤖 *Vuokraovi Rental Bot Commands*\n\n"
+	helpText += "/start - Start the bot and get current offers\n"
+	helpText += "/help - Show this help message\n"
+	helpText += "/list - List all current rental offers\n"
+	helpText += "/reset - Reset your state and get all offers again\n"
+	helpText += "/notifications - Toggle notifications on/off\n"
+	helpText += "/status - Show bot status information\n"
+	helpText += "/clear - Clear your data and reset all settings\n\n"
+	helpText += "You can also use the buttons below for quick access to commands:"
+
+	msg := tgbotapi.NewMessage(message.Chat.ID, helpText)
+	msg.ParseMode = "Markdown"
+	msg.ReplyMarkup = createMainKeyboard()
+	bot.Send(msg)
+}
+
 // handleClearCommand handles the /clear command
-func handleClearCommand(bot *tgbotapi.BotAPI, state *BotState, message *tgbotapi.Message, config BotConfig) {
+func handleClearCommand(bot *tgbotapi.BotAPI, botState *state.BotState, message *tgbotapi.Message, config BotConfig) {
 	chatID := message.Chat.ID
-	_, exists := state.GetUser(chatID)
+	_, exists := botState.GetUser(chatID)
 	if !exists {
 		msg := tgbotapi.NewMessage(chatID, "Please start the bot first with /start")
 		msg.ReplyMarkup = createMainKeyboard()
@@ -869,34 +473,12 @@ func handleClearCommand(bot *tgbotapi.BotAPI, state *BotState, message *tgbotapi
 }
 
 // handleClearConfirm handles the confirmation of clearing user data
-func handleClearConfirm(bot *tgbotapi.BotAPI, state *BotState, chatID int64, config BotConfig) {
-	state.mutex.Lock()
-	defer state.mutex.Unlock()
-
-	if user, exists := state.Users[chatID]; exists {
-		// Reset user state
-		user.SeenOffers = make(map[string]bool)
-		user.LastNotified = time.Time{}
-		user.Notifications = true
-
-		// Save state
-		if err := state.SaveState(config.DataDir); err != nil {
-			log.Printf("Error saving state after clear: %v", err)
-		}
-
-		msg := tgbotapi.NewMessage(chatID, "✅ Your data has been cleared successfully.\n\n"+
-			"• Seen offers have been reset\n"+
-			"• Notifications have been re-enabled\n\n"+
-			"You will now receive notifications for all offers again.")
-		msg.ReplyMarkup = createMainKeyboard()
-		bot.Send(msg)
-	}
-}
-
-// boolToEmoji converts a boolean to an emoji
-func boolToEmoji(b bool) string {
-	if b {
-		return "✅ Enabled"
-	}
-	return "❌ Disabled"
+func handleClearConfirm(bot *tgbotapi.BotAPI, botState *state.BotState, chatID int64, config BotConfig) {
+	botState.ResetUserState(chatID)
+	msg := tgbotapi.NewMessage(chatID, "✅ Your data has been cleared successfully.\n\n"+
+		"• Seen offers have been reset\n"+
+		"• Notifications have been re-enabled\n\n"+
+		"You will now receive notifications for all offers again.")
+	msg.ReplyMarkup = createMainKeyboard()
+	bot.Send(msg)
 }
