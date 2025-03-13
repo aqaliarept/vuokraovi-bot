@@ -239,16 +239,30 @@ func (bs *BotState) UpdateOffers(offers []RentalOffer) []RentalOffer {
 	defer bs.mutex.Unlock()
 
 	var newOffers []RentalOffer
+	currentOffers := make(map[string]bool)
 
+	// Process new offers and track current ones
 	for _, offer := range offers {
 		cleanLink := cleanURL(offer.Link)
 		if cleanLink != "" {
+			currentOffers[cleanLink] = true
 			offerCopy := offer
 			offerCopy.Link = cleanLink
 
 			if _, exists := bs.KnownOffers[cleanLink]; !exists {
 				newOffers = append(newOffers, offerCopy)
 				bs.KnownOffers[cleanLink] = offerCopy
+			}
+		}
+	}
+
+	// Remove offers that are no longer present
+	for link := range bs.KnownOffers {
+		if !currentOffers[link] {
+			delete(bs.KnownOffers, link)
+			// Also remove this offer from users' seen offers
+			for _, user := range bs.Users {
+				delete(user.SeenOffers, link)
 			}
 		}
 	}
